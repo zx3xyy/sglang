@@ -28,7 +28,6 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from torch import nn
 
 from sglang.srt.configs import (
     FalconH1Config,
@@ -43,10 +42,10 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
-    ModelConfig,
-    ModelImpl,
     get_nsa_index_head_dim,
     is_deepseek_nsa,
+    ModelConfig,
+    ModelImpl,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
@@ -72,8 +71,8 @@ from sglang.srt.eplb.expert_distribution import (
     set_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import (
-    ExpertLocationMetadata,
     compute_initial_expert_location_metadata,
+    ExpertLocationMetadata,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
@@ -95,8 +94,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
     get_global_experts_capturer,
+    RoutedExpertsCapturer,
     set_global_experts_capturer,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
@@ -147,13 +146,12 @@ from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
-    ServerArgs,
     get_global_server_args,
+    ServerArgs,
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     cpu_has_amx_support,
     dynamic_import,
     enable_show_time_cost,
@@ -167,6 +165,7 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
+    MultiprocessingSerializer,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_tp_gather,
@@ -188,6 +187,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
+from torch import nn
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -1152,6 +1152,11 @@ class ModelRunner:
 
         rank = rank_offset + self.tp_rank
 
+        # Format IPv6 addresses with brackets for URL compatibility
+        formatted_address = master_address
+        if ":" in master_address and not master_address.startswith("["):
+            formatted_address = f"[{master_address}]"
+
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
             f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
@@ -1160,7 +1165,7 @@ class ModelRunner:
         try:
             self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
-                init_method=f"tcp://{master_address}:{master_port}",
+                init_method=f"tcp://{formatted_address}:{master_port}",
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
