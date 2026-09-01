@@ -2030,7 +2030,12 @@ class AiterAttnBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-                if kv_indices.shape[0] == 0 or extend_no_prefix:
+                use_input_kv = (
+                    kv_indices.shape[0] == 0
+                    or extend_no_prefix
+                    or forward_batch.mha_one_shot
+                )
+                if use_input_kv:
                     if _use_fp8_prefill_attn:
                         output = self.mla_fp8_prefill_attn(
                             q,
@@ -2039,14 +2044,20 @@ class AiterAttnBackend(AttentionBackend):
                             layer,
                         )
                     else:
+                        direct_kv_indptr = (
+                            kv_indptr if forward_batch.mha_one_shot else qo_indptr
+                        )
+                        direct_max_kv_len = (
+                            max_kv_len if forward_batch.mha_one_shot else max_q_len
+                        )
                         output = flash_attn_varlen_func(
                             q,
                             k,
                             v,
                             qo_indptr,
-                            qo_indptr,
+                            direct_kv_indptr,
                             max_q_len,
-                            max_q_len,
+                            direct_max_kv_len,
                             softmax_scale=layer.scaling,
                             causal=True,
                         )

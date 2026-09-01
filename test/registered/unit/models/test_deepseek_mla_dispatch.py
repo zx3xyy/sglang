@@ -95,5 +95,24 @@ class TestResolveRocmForwardMethod(CustomTestCase):
                 self.assertEqual(abh.resolve_rocm_forward_method(method), method)
 
 
+class TestAiterDcpDispatch(CustomTestCase):
+    def test_extend_uses_one_shot_attention(self):
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True)
+        )
+        with (
+            mock.patch.object(abh, "is_in_tc_piecewise_cuda_graph", return_value=False),
+            mock.patch.object(abh, "is_in_breakable_cuda_graph", return_value=False),
+            mock.patch.object(
+                abh,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=True),
+            ),
+        ):
+            method = abh.handle_attention_aiter(None, forward_batch)
+
+        self.assertEqual(method, AttnForwardMethod.MHA_ONE_SHOT)
+
+
 if __name__ == "__main__":
     unittest.main()
