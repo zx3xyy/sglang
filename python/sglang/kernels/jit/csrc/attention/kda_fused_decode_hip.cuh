@@ -132,7 +132,7 @@ SGL_DEVICE float kda_hip_subgroup16_sum(float value) {
   return value + __builtin_bit_cast(float, moved);
 }
 
-template <int kThreads, bool kUseLowerBound>
+template <typename StateT, int kThreads, bool kUseLowerBound>
 __global__ __launch_bounds__(kThreads, kThreads == 512 ? 1 : 2) void kda_fused_decode_hip_kernel(
     const bf16_t* __restrict__ mixed_qkv,
     const bf16_t* __restrict__ a,
@@ -146,7 +146,7 @@ __global__ __launch_bounds__(kThreads, kThreads == 512 ? 1 : 2) void kda_fused_d
     const float* __restrict__ dt_bias,
     const bf16_t* __restrict__ onorm_g,
     const float* __restrict__ onorm_weight,
-    bf16_t* __restrict__ state,
+    StateT* __restrict__ state,
     const int32_t* __restrict__ indices,
     bf16_t* __restrict__ out,
     float scale,
@@ -335,7 +335,7 @@ __global__ __launch_bounds__(kThreads, kThreads == 512 ? 1 : 2) void kda_fused_d
 #pragma unroll
     for (int elem = 0; elem < 8; ++elem) {
       const KdaHipFloat2 packed_k = {k[elem], k[elem]};
-      // Triton uses mul+add for row%8<4, k%8==7; preserve BF16 state bits.
+      // Triton uses mul+add for row%8<4, k%8==7; preserve its update order.
       if (elem == 7) {
         h[elem] = {
             value[0] * k[elem] + h[elem][0],
@@ -344,8 +344,8 @@ __global__ __launch_bounds__(kThreads, kThreads == 512 ? 1 : 2) void kda_fused_d
       } else {
         h[elem] = __builtin_elementwise_fma(value, packed_k, h[elem]);
       }
-      state[state_base0 + elem] = device::cast<bf16_t>(h[elem][0]);
-      state[state_base1 + elem] = device::cast<bf16_t>(h[elem][1]);
+      state[state_base0 + elem] = device::cast<StateT>(h[elem][0]);
+      state[state_base1 + elem] = device::cast<StateT>(h[elem][1]);
     }
     const KdaHipFloat2 local_hq = kda_hip_dot8_pair(h, q);
     const KdaHipFloat2 dot_hq = {
@@ -394,6 +394,7 @@ struct KdaFusedDecodeHipKernel {
 
     auto B_ = SymbolicSize{"batch"};
     auto Slots_ = SymbolicSize{"pool_slots"};
+    auto StateDType_ = SymbolicDType{};
     auto device = SymbolicDevice{};
     device.set_options<kDLGPU>();
 
@@ -418,7 +419,7 @@ struct KdaFusedDecodeHipKernel {
     TensorMatcher({B_, kKdaHipSeg}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(onorm_g);
     TensorMatcher({kKdaHipDim}).with_dtype<fp32_t>().with_device(device).with_strides({1}).verify(onorm_weight);
     TensorMatcher({Slots_, kKdaHipHeads, kKdaHipDim, kKdaHipDim})
-        .with_dtype<bf16_t>()
+        .with_dtype<bf16_t, fp32_t>(StateDType_)
         .with_device(device)
         .with_strides({-1, kKdaHipDim * kKdaHipDim, kKdaHipDim, 1})
         .verify(state);
@@ -428,7 +429,7 @@ struct KdaFusedDecodeHipKernel {
     const int batch = static_cast<int>(B_.unwrap());
     RuntimeCheck(batch > 0, "HIP KDA fused decode requires a positive batch size");
 
-    const auto launch = [&](auto kernel, int threads) {
+    const auto launch = [&](auto kernel, auto* state_ptr, int threads) {
       LaunchKernel(dim3(batch, kKdaHipHeads), dim3(threads), device.unwrap())(
           kernel,
           static_cast<const bf16_t*>(mixed_qkv.data_ptr()),
@@ -443,7 +444,7 @@ struct KdaFusedDecodeHipKernel {
           static_cast<const fp32_t*>(dt_bias.data_ptr()),
           static_cast<const bf16_t*>(onorm_g.data_ptr()),
           static_cast<const fp32_t*>(onorm_weight.data_ptr()),
-          static_cast<bf16_t*>(state.data_ptr()),
+          state_ptr,
           static_cast<const int32_t*>(indices.data_ptr()),
           static_cast<bf16_t*>(out.data_ptr()),
           static_cast<float>(scale),
@@ -458,14 +459,26 @@ struct KdaFusedDecodeHipKernel {
           state.stride(0));
     };
 
-    if (batch <= kKdaHipSmallBatchMax) {
-      const auto kernel = use_lower_bound ? kda_fused_decode_hip_kernel<kKdaHipSmallBatchThreads, true>
-                                          : kda_fused_decode_hip_kernel<kKdaHipSmallBatchThreads, false>;
-      launch(kernel, kKdaHipSmallBatchThreads);
+    if (StateDType_.is_type<bf16_t>()) {
+      if (batch <= kKdaHipSmallBatchMax) {
+        const auto kernel = use_lower_bound ? kda_fused_decode_hip_kernel<bf16_t, kKdaHipSmallBatchThreads, true>
+                                            : kda_fused_decode_hip_kernel<bf16_t, kKdaHipSmallBatchThreads, false>;
+        launch(kernel, static_cast<bf16_t*>(state.data_ptr()), kKdaHipSmallBatchThreads);
+      } else {
+        const auto kernel = use_lower_bound ? kda_fused_decode_hip_kernel<bf16_t, kKdaHipLargeBatchThreads, true>
+                                            : kda_fused_decode_hip_kernel<bf16_t, kKdaHipLargeBatchThreads, false>;
+        launch(kernel, static_cast<bf16_t*>(state.data_ptr()), kKdaHipLargeBatchThreads);
+      }
     } else {
-      const auto kernel = use_lower_bound ? kda_fused_decode_hip_kernel<kKdaHipLargeBatchThreads, true>
-                                          : kda_fused_decode_hip_kernel<kKdaHipLargeBatchThreads, false>;
-      launch(kernel, kKdaHipLargeBatchThreads);
+      if (batch <= kKdaHipSmallBatchMax) {
+        const auto kernel = use_lower_bound ? kda_fused_decode_hip_kernel<fp32_t, kKdaHipSmallBatchThreads, true>
+                                            : kda_fused_decode_hip_kernel<fp32_t, kKdaHipSmallBatchThreads, false>;
+        launch(kernel, static_cast<fp32_t*>(state.data_ptr()), kKdaHipSmallBatchThreads);
+      } else {
+        const auto kernel = use_lower_bound ? kda_fused_decode_hip_kernel<fp32_t, kKdaHipLargeBatchThreads, true>
+                                            : kda_fused_decode_hip_kernel<fp32_t, kKdaHipLargeBatchThreads, false>;
+        launch(kernel, static_cast<fp32_t*>(state.data_ptr()), kKdaHipLargeBatchThreads);
+      }
     }
   }
 };

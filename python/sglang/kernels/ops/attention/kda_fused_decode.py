@@ -11,7 +11,7 @@ The CUDA kernel is vendored from the NVIDIA x Moonshot Kimi K3 optimization
 package. The HIP kernel implements the same mutation and output contract for
 the K3 decode regime: K = V = 128, kernel width 4, T = 1 per request.
 The CUDA JIT instantiates local head counts H = HV in {12, 6, 3}. The ROCm
-JIT is limited to gfx950, H = HV = 12, and BF16 state.
+JIT is limited to gfx950 and H = HV = 12, with BF16 or FP32 state.
 
 The model must hand off the output-norm gate (attempt-and-verify stash on the
 attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
@@ -98,7 +98,6 @@ def covered(
             or ssm_states.ndim != 4
             or H != _HIP_HEADS
             or B < 1
-            or ssm_states.dtype != torch.bfloat16
         ):
             return False
     elif H not in _SUPPORTED_HEADS:
@@ -120,7 +119,11 @@ def covered(
         and b.dtype == torch.bfloat16
         and onorm_g.dtype == torch.bfloat16
         and conv_states.dtype == torch.bfloat16
-        and ssm_states.dtype == (torch.bfloat16 if use_hip_kernel else torch.float32)
+        and (
+            ssm_states.dtype in (torch.bfloat16, torch.float32)
+            if use_hip_kernel
+            else ssm_states.dtype == torch.float32
+        )
         and cache_indices.dtype == torch.int32
         and mixed_qkv.stride(-1) == 1
         and a.stride(-1) == 1

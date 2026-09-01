@@ -5,7 +5,7 @@ The fused kernel replaces:
     causal_conv1d_update -> kda_packed_decode -> sigmoid-gated RMSNorm
 
 CUDA coverage spans Kimi-K3 TP8/TP16/TP32 (H = 12/6/3). ROCm coverage targets
-the gfx950 TP8 path with H = 12 and BF16 recurrent state.
+the gfx950 TP8 path with H = 12 and BF16 or FP32 recurrent state.
 """
 
 import pytest
@@ -275,8 +275,11 @@ def test_kda_fused_decode_hip_coverage():
     assert kda_fused_decode.covered(
         mixed_qkv, a, b, conv_states, ssm_states, cache_indices, onorm_g
     )
-    assert not kda_fused_decode.covered(
+    assert kda_fused_decode.covered(
         mixed_qkv, a, b, conv_states, ssm_states.float(), cache_indices, onorm_g
+    )
+    assert not kda_fused_decode.covered(
+        mixed_qkv, a, b, conv_states, ssm_states.half(), cache_indices, onorm_g
     )
     assert not kda_fused_decode.covered(
         mixed_qkv,
@@ -294,20 +297,24 @@ def test_kda_fused_decode_hip_coverage():
 
 @pytest.mark.skipif(not _is_gfx950(), reason="requires gfx950 ROCm")
 @pytest.mark.parametrize(
-    "batch,use_graph",
+    "state_dtype,batch,use_graph",
     [
-        pytest.param(1, False, id="eager_b1"),
-        pytest.param(64, True, id="graph_b64"),
+        pytest.param(torch.bfloat16, 1, False, id="bf16_eager_b1"),
+        pytest.param(torch.bfloat16, 64, True, id="bf16_graph_b64"),
+        pytest.param(torch.float32, 1, False, id="fp32_eager_b1"),
+        pytest.param(torch.float32, 64, True, id="fp32_graph_b64"),
     ],
 )
-def test_kda_fused_decode_hip_matches_unfused(batch: int, use_graph: bool):
+def test_kda_fused_decode_hip_matches_unfused(
+    state_dtype: torch.dtype, batch: int, use_graph: bool
+):
     slots = batch + 2
     case = _make_case(
         heads=_HIP_HEADS,
         batch=batch,
         slots=slots,
         seed=20260901 + batch,
-        state_dtype=torch.bfloat16,
+        state_dtype=state_dtype,
     )
     (
         mixed_qkv,
@@ -384,7 +391,7 @@ def test_kda_fused_decode_hip_matches_unfused(batch: int, use_graph: bool):
             batch=batch,
             slots=slots,
             seed=202609100 + batch * 10 + step,
-            state_dtype=torch.bfloat16,
+            state_dtype=state_dtype,
         )
         mixed_qkv.copy_(step_case[0])
         a.copy_(step_case[1])
@@ -422,7 +429,10 @@ def test_kda_fused_decode_hip_matches_unfused(batch: int, use_graph: bool):
         torch.cuda.synchronize()
 
         torch.testing.assert_close(fused, ref, rtol=2e-2, atol=2e-2)
-        assert torch.equal(ssm_states, state_ref)
+        if state_dtype == torch.bfloat16:
+            assert torch.equal(ssm_states, state_ref)
+        else:
+            torch.testing.assert_close(ssm_states, state_ref, rtol=1e-5, atol=1e-6)
         assert torch.equal(conv_states, conv_ref)
         assert torch.equal(state_storage[:, 1], state_canary)
         if batch > 1 and step:
