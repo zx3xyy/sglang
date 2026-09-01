@@ -26,10 +26,11 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
+    dcp_a2a_lse_reduce,
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, unwrap_write_loc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -51,12 +52,14 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_hip,
     is_xpu,
     next_power_of_2,
 )
 
 _is_cuda = is_cuda()
 _is_gfx942 = is_gfx942_supported()
+_is_hip = is_hip()
 _is_xpu = is_xpu()
 
 if _is_cuda:
@@ -1299,6 +1302,22 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
+    def _set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        k: torch.Tensor,
+    ) -> None:
+        cache_k_nope, cache_k_rope = k.split(
+            [layer.v_head_dim, layer.qk_head_dim - layer.v_head_dim], dim=-1
+        )
+        loc, _, full_loc = unwrap_write_loc(loc_info)
+        if full_loc is not None:
+            raise NotImplementedError(
+                "Triton MLA DCP does not support unified-memory KV translation."
+            )
+        self.token_to_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1821,20 +1840,15 @@ class TritonAttnBackend(AttentionBackend):
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    # `full_loc` carries the pre-translated loc under the unified
-                    # pool, refreshed into a capture-stable buffer before replay —
-                    # translating inside set_kv_buffer would be captured and replay
-                    # a stale v2p. None (-> raw loc) for static pools.
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
-                        full_loc=self.forward_metadata.out_cache_loc_full_physical,
-                    ),
-                    k,
-                    v,
+                loc_info = KVWriteLoc(
+                    forward_batch.out_cache_loc,
+                    self.forward_metadata.swa_out_cache_loc,
+                    full_loc=self.forward_metadata.out_cache_loc_full_physical,
                 )
+                if self.dcp_size > 1:
+                    self._set_mla_kv_buffer(layer, loc_info, k)
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(layer, loc_info, k, v)
             else:
                 self._set_kv_buffer(
                     forward_batch,
@@ -1879,7 +1893,8 @@ class TritonAttnBackend(AttentionBackend):
                 raise NotImplementedError(
                     "DCP Triton decode does not support score_mod"
                 )
-            group = get_parallel().dcp_group
+            parallel = get_parallel()
+            group = parallel.dcp_group
             with use_symmetric_memory(group):
                 q_for_decode = q.view(
                     -1, layer.tp_q_head_num, layer.qk_head_dim
@@ -1890,7 +1905,21 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.float32,
                 device=q.device,
             )
-            self.forward_metadata.attn_lse.fill_(-float("inf"))
+            use_direct_lse = (
+                _is_hip
+                and self.use_mla
+                and parallel.dcp_comm_backend == "a2a"
+                and sinks is None
+            )
+            if use_direct_lse:
+                local_lse = torch.empty(
+                    (q_for_decode.shape[0], q_for_decode.shape[1]),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+            else:
+                local_lse = None
+                self.forward_metadata.attn_lse.fill_(-float("inf"))
             self.decode_attention_fwd(
                 q_for_decode,
                 self.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -1908,14 +1937,33 @@ class TritonAttnBackend(AttentionBackend):
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
+                has_mla=self.use_mla,
+                use_pdl=self.use_pdl,
+                page_size=self.page_size,
+                output_lse=local_lse,
             )
-            local_lse = torch.logsumexp(
-                self.forward_metadata.attn_lse[
-                    : q_for_decode.shape[0], : q_for_decode.shape[1], :
-                ],
-                dim=-1,
-            )
-            o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
+            if local_lse is None:
+                local_lse = torch.logsumexp(
+                    self.forward_metadata.attn_lse[
+                        : q_for_decode.shape[0], : q_for_decode.shape[1], :
+                    ],
+                    dim=-1,
+                )
+            if use_direct_lse:
+                o_for_decode.masked_fill_(torch.isneginf(local_lse).unsqueeze(-1), 0.0)
+            if _is_hip:
+                if self.use_mla and parallel.dcp_comm_backend == "a2a":
+                    o = dcp_a2a_lse_reduce(
+                        o_for_decode.contiguous(),
+                        local_lse.contiguous(),
+                        group,
+                        is_lse_base_on_e=True,
+                        comm_backend="a2a",
+                    )
+                else:
+                    o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
+            else:
+                o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
         self.decode_attention_fwd(
