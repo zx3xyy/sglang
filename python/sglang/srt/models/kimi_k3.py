@@ -1783,7 +1783,7 @@ class KimiK3DeltaAttention(nn.Module):
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
-            layer.A_log.detach().reshape(-1).contiguous(),
+            layer.A_log.detach().reshape(-1),  # view; kernel wants [12]
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
@@ -1863,10 +1863,13 @@ class KimiK3DeltaAttention(nn.Module):
         beta = beta.unsqueeze(0)
 
         # Fused KDA handoff (attempt-and-verify): offer the output-norm gate
-        # to covered decode kernels and the CUDA target-verify kernel.
+        # so covered decode and target-verify kernels can fold gated RMSNorm
+        # into the recurrence kernel. If the backend leaves the stash
+        # unconsumed (env off or shape not covered), apply o_norm here as
+        # before.
         fused_onorm = self._kda_fused_decode_ready and (
             forward_batch.forward_mode.is_decode()
-            or (not _is_hip and forward_batch.forward_mode.is_target_verify())
+            or forward_batch.forward_mode.is_target_verify()
         )
         if fused_onorm:
             self.attn._k3_onorm_gate = g_proj_states

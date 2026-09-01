@@ -90,15 +90,9 @@ def covered(
     if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != conv_dim:
         return False
 
-    B = mixed_qkv.shape[0]
     use_hip_kernel = is_hip_runtime() and mixed_qkv.is_cuda
     if use_hip_kernel:
-        if (
-            not _is_gfx950(mixed_qkv.device)
-            or ssm_states.ndim != 4
-            or H != _HIP_HEADS
-            or B < 1
-        ):
+        if not _is_gfx950(mixed_qkv.device) or ssm_states.ndim != 4 or H != _HIP_HEADS:
             return False
     elif H not in _SUPPORTED_HEADS:
         return False
