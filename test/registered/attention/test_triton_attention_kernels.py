@@ -759,6 +759,126 @@ class TestTritonAttention(CustomTestCase):
         for B, H_Q, H_KV, D in configs:
             self._test_decode_attention_once(B, H_Q, H_KV, D)
 
+    def test_decode_attention_returns_lse(self):
+        device = get_device()
+        batch_size, num_q_heads, head_dim, seq_len = 2, 4, 64, 10
+        total_tokens = batch_size * seq_len
+        q = torch.randn(
+            batch_size, num_q_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        k = torch.randn(total_tokens, 1, head_dim, dtype=torch.bfloat16, device=device)
+        v = torch.randn_like(k)
+        output = torch.empty_like(q)
+        output_lse = torch.empty(
+            batch_size, num_q_heads, dtype=torch.float32, device=device
+        )
+        kv_indptr = torch.arange(
+            0,
+            total_tokens + 1,
+            seq_len,
+            dtype=torch.int32,
+            device=device,
+        )
+        kv_indices = torch.arange(total_tokens, dtype=torch.int64, device=device)
+        max_kv_splits = 8
+        attn_logits = torch.empty(
+            batch_size,
+            num_q_heads,
+            max_kv_splits,
+            head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        attn_lse = torch.empty(
+            batch_size,
+            num_q_heads,
+            max_kv_splits,
+            dtype=torch.float32,
+            device=device,
+        )
+        num_kv_splits = torch.full((batch_size,), 4, dtype=torch.int32, device=device)
+        scale = 1.0 / head_dim**0.5
+
+        decode_attention_fwd(
+            q,
+            k,
+            v,
+            output,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            max_kv_splits,
+            scale,
+            1.0,
+            1.0,
+            output_lse=output_lse,
+        )
+
+        expected = torch.empty_like(output_lse)
+        for batch_idx in range(batch_size):
+            start = batch_idx * seq_len
+            stop = start + seq_len
+            scores = torch.einsum(
+                "hd,kd->hk",
+                q[batch_idx].float(),
+                k[start:stop, 0].float(),
+            )
+            expected[batch_idx] = torch.logsumexp(scores * scale, dim=-1)
+        torch.testing.assert_close(output_lse, expected, atol=2e-2, rtol=2e-2)
+
+    def test_decode_attention_returns_negative_infinity_lse_for_empty_kv(self):
+        device = get_device()
+        batch_size, num_q_heads, head_dim = 1, 4, 64
+        q = torch.randn(
+            batch_size, num_q_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        k = torch.empty(1, 1, head_dim, dtype=torch.bfloat16, device=device)
+        v = torch.empty_like(k)
+        output = torch.empty_like(q)
+        output_lse = torch.empty(
+            batch_size, num_q_heads, dtype=torch.float32, device=device
+        )
+        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        kv_indices = torch.empty(0, dtype=torch.int64, device=device)
+        max_kv_splits = 1
+        attn_logits = torch.empty(
+            batch_size,
+            num_q_heads,
+            max_kv_splits,
+            head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        attn_lse = torch.empty(
+            batch_size,
+            num_q_heads,
+            max_kv_splits,
+            dtype=torch.float32,
+            device=device,
+        )
+        num_kv_splits = torch.ones(batch_size, dtype=torch.int32, device=device)
+
+        decode_attention_fwd(
+            q,
+            k,
+            v,
+            output,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            max_kv_splits,
+            1.0 / head_dim**0.5,
+            1.0,
+            1.0,
+            output_lse=output_lse,
+        )
+
+        self.assertTrue(torch.isneginf(output_lse).all())
+
     def _test_grouped_decode_attention_once(self, B, S, H_Q, H_KV, D, D_V):
         dtype = torch.bfloat16
         device = get_device()

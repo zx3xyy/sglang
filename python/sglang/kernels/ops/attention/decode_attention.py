@@ -912,6 +912,7 @@ def _fwd_kernel_stage2(
     Mid_O,
     Mid_O_1,
     O,
+    Out_Lse,
     v_scale,
     kv_indptr,
     num_kv_splits,
@@ -921,11 +922,14 @@ def _fwd_kernel_stage2(
     stride_mid_os,
     stride_obs,
     stride_oh,
+    stride_out_lse_b,
+    stride_out_lse_h,
     MAX_KV_SPLITS: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    RETURN_LSE: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     FORCED_KV_SPLITS: tl.constexpr = 0,
 ):
@@ -992,6 +996,11 @@ def _fwd_kernel_stage2(
         acc / e_sum * v_scale,
         mask=mask_d,
     )
+    if RETURN_LSE:
+        tl.store(
+            Out_Lse + cur_batch * stride_out_lse_b + cur_head * stride_out_lse_h,
+            tl.log(e_sum) + e_max,
+        )
 
 
 def _decode_softmax_reducev_fwd(
@@ -1007,6 +1016,7 @@ def _decode_softmax_reducev_fwd(
     sinks=None,
     use_pdl=False,
     forced_kv_splits: int = 0,
+    output_lse=None,
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
@@ -1022,10 +1032,12 @@ def _decode_softmax_reducev_fwd(
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     grid = (batch, head_num)
+    output_lse_arg = output_lse if output_lse is not None else lse
     _fwd_kernel_stage2[grid](
         logits,
         lse,
         o,
+        output_lse_arg,
         v_scale,
         kv_indptr,
         num_kv_splits,
@@ -1035,11 +1047,14 @@ def _decode_softmax_reducev_fwd(
         logits.stride(2),
         o.stride(0),
         o.stride(1),
+        output_lse_arg.stride(0),
+        output_lse_arg.stride(1),
         MAX_KV_SPLITS=MAX_KV_SPLITS,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         HAS_SINK=HAS_SINK,
+        RETURN_LSE=output_lse is not None,
         USE_PDL=use_pdl,
         FORCED_KV_SPLITS=forced_kv_splits,
         num_warps=4,
@@ -1068,6 +1083,7 @@ def decode_attention_fwd_normal(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    output_lse=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -1097,6 +1113,7 @@ def decode_attention_fwd_normal(
         num_kv_splits,
         max_kv_splits,
         sinks,
+        output_lse=output_lse,
     )
 
 
@@ -1121,6 +1138,7 @@ def decode_attention_fwd_grouped(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    output_lse=None,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1157,6 +1175,7 @@ def decode_attention_fwd_grouped(
         sinks,
         use_pdl=use_pdl,
         forced_kv_splits=forced_kv_splits,
+        output_lse=output_lse,
     )
 
 
@@ -1182,6 +1201,7 @@ def decode_attention_fwd(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    output_lse=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -1212,6 +1232,7 @@ def decode_attention_fwd(
             page_size=page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            output_lse=output_lse,
         )
     else:
         # GQA/MQA/MLA
@@ -1236,4 +1257,5 @@ def decode_attention_fwd(
             page_size=page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            output_lse=output_lse,
         )

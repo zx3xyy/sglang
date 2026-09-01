@@ -487,9 +487,33 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
             )
+        elif decode_backend == "triton" and is_hip():
+            if prefill_backend != "aiter":
+                raise ValueError(
+                    "Kimi-K3 ROCm Triton DCP requires prefill backend 'aiter'."
+                )
+            if server_args.speculative_algorithm is not None:
+                raise ValueError(
+                    "Kimi-K3 ROCm Triton DCP does not support speculative decoding."
+                )
+            if server_args.enable_unified_memory:
+                raise ValueError(
+                    "Kimi-K3 ROCm Triton DCP does not support the unified memory pool."
+                )
+            logger.info(
+                "Kimi-K3 ROCm DCP keeps attention backends "
+                f"prefill={prefill_backend!r}, decode='triton'."
+            )
+            overrides.update(
+                dcp_comm_backend="a2a",
+                dcp_replicate_q_proj=False,
+            )
+            return overrides
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
+                "Decode attention backend for Kimi-K3 DCP must be "
+                "'cutedsl_mla', 'tokenspeed_mla', or 'triton' on HIP, got "
+                f"{decode_backend!r}."
             )
 
         if server_args.dcp_replicate_q_proj is None:
