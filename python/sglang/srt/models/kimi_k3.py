@@ -1745,9 +1745,6 @@ class KimiK3DeltaAttention(nn.Module):
         the compiled kernel the stash stays unset and decode keeps the
         unfused chain. Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
-        if _is_hip:
-            # The fused KDA decode kernel is NVIDIA-only
-            return
         layer = self.attn
         w = layer.conv_weights
         if _is_npu:
@@ -1786,7 +1783,7 @@ class KimiK3DeltaAttention(nn.Module):
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
-            layer.A_log.detach().reshape(-1),  # view; kernel wants [12]
+            layer.A_log.detach().reshape(-1).contiguous(),
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
@@ -1866,13 +1863,10 @@ class KimiK3DeltaAttention(nn.Module):
         beta = beta.unsqueeze(0)
 
         # Fused KDA handoff (attempt-and-verify): offer the output-norm gate
-        # so covered decode and target-verify kernels can fold gated RMSNorm
-        # into the recurrence kernel. If the backend leaves the stash
-        # unconsumed (env off or shape not covered), apply o_norm here as
-        # before.
+        # to covered decode kernels and the CUDA target-verify kernel.
         fused_onorm = self._kda_fused_decode_ready and (
             forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
+            or (not _is_hip and forward_batch.forward_mode.is_target_verify())
         )
         if fused_onorm:
             self.attn._k3_onorm_gate = g_proj_states
